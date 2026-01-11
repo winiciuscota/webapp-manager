@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+import os
+import tempfile
+import shutil
+import urllib.request
+import urllib.parse
+import re
+import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def run_rofi(options=None, prompt="WebApps", prefill=None, show_icons=False):
+    """Run rofi with given options and return selected item"""
+    rofi_cmd = ["rofi", "-dmenu", "-p", prompt, "-i"]
+    
+    if show_icons:
+        rofi_cmd.extend(["-show-icons"])
+    
+    try:
+        if options:
+            # Selection from list
+            result = subprocess.run(
+                rofi_cmd,
+                input="\n".join(options),
+                capture_output=True,
+                text=True
+            )
+        elif prefill:
+            # Free-form text input with pre-filled value
+            result = subprocess.run(
+                rofi_cmd,
+                input=prefill,
+                capture_output=True,
+                text=True
+            )
+        else:
+            # Free-form text input - don't pipe anything
+            result = subprocess.run(
+                rofi_cmd,
+                capture_output=True,
+                text=True
+            )
+        
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return None
+    except Exception as e:
+        print(f"Error running rofi: {e}", file=sys.stderr)
+        return None
+
+def get_webapps():
+    """Get list of webapps from webapps script"""
+    try:
+        result = subprocess.run(
+            ["webapps.old", "list"],
+            capture_output=True,
+            text=True
+        )
+        webapps = []
+        current = {}
+        
+        for line in result.stdout.split('\n'):
+            if line.startswith('  •'):
+                if current.get('name') and current.get('url'):
+                    webapps.append(current)
+                current = {'name': line[4:].strip()}
+            elif line.strip().startswith('URL:'):
+                url = line.split('URL:', 1)[1].strip()
+                # Strip leading and trailing quotes
+                current['url'] = url.strip('"').strip("'")
+            elif line.strip().startswith('Isolated:'):
+                current['isolated'] = 'True' in line
+            elif line.strip().startswith('File:'):
+                current['file'] = line.split('File:', 1)[1].strip()
+        
+        if current.get('name') and current.get('url'):
+            webapps.append(current)
+        
+        # Get icon paths from desktop files
+        for webapp in webapps:
+            if webapp.get('file'):
+                try:
+                    with open(webapp['file'], 'r') as f:
+                        for line in f:
+                            if line.startswith('Icon='):
+                                webapp['icon'] = line.split('Icon=', 1)[1].strip()
+                                break
+                except:
+                    pass
+        
+        return webapps
+    except Exception as e:
+        print(f"Error getting webapps: {e}", file=sys.stderr)
+        return []
+
+
+def search_icons(query, count=10, offset=0):
+    """Search DuckDuckGo for icons with pagination support"""
+    try:
+        search_query = urllib.parse.quote_plus(f"{query} icon logo")
+        url = f"https://duckduckgo.com/?q={search_query}&t=h_&iax=images&ia=images"
+        headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'}
+        
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            html = response.read().decode('utf-8')
+        
+        vqd_match = re.search(r'vqd[="]([\d-]+)', html)
+        if vqd_match:
+            api_url = f"https://duckduckgo.com/i.js?q={search_query}&vqd={vqd_match.group(1)}&f=,,,,,&l=us-en"
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                all_results = [r['image'] for r in data.get('results', []) if r.get('image')]
+                # Return slice based on offset and count
+                return all_results[offset:offset+count]
+        
+        # Fallback: extract from HTML
+        img_matches = re.findall(r'"image":"([^"]+)"', html)
+        if img_matches:
+            clean_matches = [m.replace('\\', '') for m in img_matches]
+            return clean_matches[offset:offset+count]
+    except Exception as e:
+        print(f"Error searching icons: {e}", file=sys.stderr)
+    
+    return []
+
+def download_icon(url, dest):
+    """Download icon from URL"""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'}
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=3) as response:
+            with open(dest, 'wb') as f:
+                f.write(response.read())
+        return True
+    except Exception as e:
+        print(f"Error downloading icon: {e}", file=sys.stderr)
+        return False
+
+def change_webapp_icon(webapp_name):
+    """Change webapp icon using rofi to select from online search results"""
+    temp_dir = Path(tempfile.mkdtemp(prefix='rofi-webapps-icons-'))
+    offset = 0
+    
+    try:
+        while True:
+            # Notify user we're searching
+            notification_proc = subprocess.Popen(["notify-send", "-t", "3000", "WebApps", f"Searching icons for {webapp_name}..."])
+            
+            try:
+                icons = search_icons(webapp_name, count=10, offset=offset)
+            except Exception as e:
+                subprocess.run(["notify-send", "-u", "critical", "WebApps", f"Search failed: {str(e)[:50]}"])
+                return False
+            
+            if not icons:
+                if offset == 0:
+                    subprocess.run(["notify-send", "WebApps", "No icons found"])
+                else:
+                    subprocess.run(["notify-send", "WebApps", "No more icons available"])
+                return False
+            
+            # Notify user we're downloading with progress
+            notification_proc = subprocess.Popen(["notify-send", "-t", "10000", "WebApps", f"Downloading {len(icons)} icons..."])
+            
+            options = []
+            icon_map = {}
+            download_count = 0
+            error_count = 0
+            
+            # Download icons in parallel for speed
+            def download_task(idx_url):
+                idx, url = idx_url
+                temp_file = temp_dir / f"icon_{offset + idx}.png"
+                try:
+                    if download_icon(url, temp_file) and temp_file.exists():
+                        return idx, temp_file, None
+                except Exception as e:
+                    return None, None, str(e)
+                return None, None, "Download failed"
+            
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = {executor.submit(download_task, (idx, url)): (idx, url) 
+                          for idx, url in enumerate(icons, 1)}
+                
+                for future in as_completed(futures):
+                    idx, temp_file, error = future.result()
+                    if idx and temp_file:
+                        display = f"Icon {offset + idx}\x00icon\x1f{temp_file}"
+                        options.append(display)
+                        icon_map[f"Icon {offset + idx}"] = temp_file
+                        download_count += 1
+                        # Update progress notification
+                        if download_count % 3 == 0 or download_count == len(icons):
+                            subprocess.Popen(["notify-send", "-t", "2000", "WebApps", f"Downloaded {download_count}/{len(icons)} icons"])
+                    elif error:
+                        error_count += 1
+            
+            # Final status notification
+            if error_count > 0:
+                subprocess.Popen(["notify-send", "-t", "3000", "WebApps", f"⚠ {download_count} downloaded, {error_count} failed"])
+            elif download_count > 0:
+                subprocess.Popen(["notify-send", "-t", "2000", "WebApps", f"✓ Ready! {download_count} icons loaded"])
+            
+            if not options:
+                subprocess.run(["notify-send", "-u", "critical", "WebApps", "Failed to download any icons"])
+                return False
+            
+            # Add More option
+            more_icon = "/usr/share/icons/HighContrast/24x24/actions/list-add.png"
+            options.append(f" More...\x00icon\x1f{more_icon}")
+            
+            selected = run_rofi(options, prompt=f"Select icon for {webapp_name}", show_icons=True)
+            if not selected:
+                return False
+            
+            selected = selected.split('\x00')[0].strip()
+            
+            # Check if user selected More
+            if selected == "More...":
+                offset += 10
+                continue
+            
+            icon_file = icon_map.get(selected)
+            if not icon_file:
+                return False
+            
+            webapp_name_clean = ''.join(c for c in webapp_name if c.isalnum())
+            icon_dest = Path.home() / ".local/share/icons/webapps" / f"{webapp_name_clean.lower()}.png"
+            icon_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(icon_file, icon_dest)
+            
+            subprocess.run(["notify-send", "WebApps", f"Icon updated for {webapp_name}"])
+            return True
+        
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def main():
+    while True:
+        webapps = get_webapps()
+        
+        # Build options list with icon metadata for alignment
+        create_icon = "/usr/share/icons/HighContrast/24x24/actions/list-add.png"
+        options = [f" Create Webapp\x00icon\x1f{create_icon}"]
+        webapp_map = {}
+        
+        for webapp in webapps:
+            isolated_marker = " 🔒" if webapp.get('isolated') else ""
+            display = f" {webapp['name']} > {webapp['url']}{isolated_marker}"
+            # Add icon metadata for rofi
+            if webapp.get('icon'):
+                display = f"{display}\x00icon\x1f{webapp['icon']}"
+            options.append(display)
+            # Store in map without leading space since rofi strips it
+            webapp_map[display.split('\x00')[0].strip()] = webapp
+        
+        # Show main menu with icons
+        selected = run_rofi(options, show_icons=True)
+        if not selected:
+            sys.exit(0)
+        
+        # Remove icon metadata from selected and strip whitespace
+        selected = selected.split('\x00')[0].strip()
+        
+        # Handle Create Webapp
+        if selected == "Create Webapp":
+            name = run_rofi(prompt="App Name")
+            if not name:
+                continue
+            url = run_rofi(prompt="URL (optional)")
+            subprocess.run(["webapps.old", "create", name, url or ""])
+            subprocess.run(["notify-send", "WebApps", f"Created {name}"])
+            continue
+        
+        # Handle webapp selection - show options
+        webapp = webapp_map.get(selected)
+        if not webapp:
+            continue
+        
+        while True:
+            edit_options = ["🚀 Open", "🗑️  Delete", "✏️  Edit", "🎨 Change Icon"]
+            action = run_rofi(edit_options, prompt=webapp['name'])
+            
+            if not action:
+                # ESC pressed - go back to main menu
+                break
+            
+            if action == "🚀 Open":
+                # Launch the desktop file directly
+                if webapp.get('file'):
+                    subprocess.run(["gtk-launch", os.path.basename(webapp['file']).replace('.desktop', '')])
+                sys.exit(0)
+            
+            elif action == "🗑️  Delete":
+                subprocess.run(["webapps.old", "delete", webapp['name']])
+                subprocess.run(["notify-send", "WebApps", f"Deleted {webapp['name']}"])
+                break
+            
+            elif action == "✏️  Edit":
+                new_name = run_rofi(prompt="New Name", prefill=webapp['name'])
+                if new_name is None:
+                    # ESC pressed - stay in options menu
+                    continue
+                
+                # Empty means keep current value
+                if not new_name:
+                    new_name = webapp['name']
+                
+                new_url = run_rofi(prompt="New URL", prefill=webapp['url'])
+                if new_url is None:
+                    # ESC pressed - stay in options menu
+                    continue
+                
+                # Empty means keep current value
+                if not new_url:
+                    new_url = webapp['url']
+                
+                isolated_flag = ["--isolated"] if webapp.get('isolated') else []
+                subprocess.run(["webapps.old", "delete", webapp['name']])
+                subprocess.run(["webapps.old", "create", new_name, new_url] + isolated_flag)
+                subprocess.run(["notify-send", "WebApps", f"Updated to {new_name}"])
+                break
+            
+            elif action == "🎨 Change Icon":
+                # Use rofi-based icon selection
+                if change_webapp_icon(webapp['name']):
+                    # Icon changed successfully, return to main menu to refresh
+                    break
+                # If cancelled or failed, stay in options menu
+
+if __name__ == "__main__":
+    main()

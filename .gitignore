@@ -1,0 +1,35 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Package files
+*.tar.gz
+*.zip
+pkg/
+src/
+
+# Temporary files
+*.tmp
+*.bak
+*.log

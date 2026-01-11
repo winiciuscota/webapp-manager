@@ -1,0 +1,694 @@
+#!/usr/bin/env python3
+
+"""
+Web App Manager - Create and manage web applications as desktop entries
+
+Usage:
+    wpp-manager create "App Name" ["https://app.url"] [--icon /path/to/icon.png] [--isolated]
+    wpp-manager delete "App Name"
+    wpp-manager list
+    wpp-manager change-icon "App Name"
+"""
+
+import argparse
+import os
+import re
+import shutil
+import sys
+import random
+from pathlib import Path
+from urllib.parse import quote_plus, urlparse
+import urllib.request
+import json
+
+APP_DIR = Path.home() / ".local/share/applications"
+PROFILE_DIR = Path.home() / ".local/share/ice/profiles"
+ICON_DIR = Path.home() / ".local/share/icons/webapps"
+SCRIPT_DIR = Path.home() / ".local/bin"
+DESKTOP_PREFIX = "webapp-"
+
+
+def safe_name(name):
+    """Convert app name to safe filename (preserves case for display)"""
+    return re.sub(r'[^\w\-]', '', name.replace(' ', ''))
+
+
+def generate_profile_id(name):
+    """Generate a unique profile ID like Waze6264"""
+    safe = safe_name(name)
+    random_suffix = random.randint(1000, 9999)
+    return f"{safe}{random_suffix}"
+
+
+def search_duckduckgo_icons(query, count=None):
+    """Search DuckDuckGo for icons. Returns list if count specified, else first result URL"""
+    try:
+        search_query = quote_plus(f"{query} icon logo")
+        url = f"https://duckduckgo.com/?q={search_query}&t=h_&iax=images&ia=images"
+        headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'}
+        
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=10) as response:
+            html = response.read().decode('utf-8')
+        
+        vqd_match = re.search(r'vqd[="]([\d-]+)', html)
+        if vqd_match:
+            api_url = f"https://duckduckgo.com/i.js?q={search_query}&vqd={vqd_match.group(1)}&f=,,,,,&l=us-en"
+            with urllib.request.urlopen(urllib.request.Request(api_url, headers=headers), timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                results = [r['image'] for r in data.get('results', [])[:count or 1] if r.get('image')]
+                return results if count else (results[0] if results else None)
+        
+        # Fallback: extract from HTML
+        if not count:
+            img_match = re.search(r'"image":"([^"]+)"', html)
+            if img_match:
+                return img_match.group(1).replace('\\', '')
+    except Exception as e:
+        print(f"Warning: Could not search icons on DuckDuckGo: {e}", file=sys.stderr)
+    
+    return [] if count else None
+
+
+def search_duckduckgo_url(query):
+    """Search DuckDuckGo and return first result URL"""
+    try:
+        search_query = quote_plus(query)
+        url = f"https://duckduckgo.com/html/?q={search_query}"
+        headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'}
+        
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=10) as response:
+            html = response.read().decode('utf-8')
+        
+        # Extract first result URL
+        url_match = re.search(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html)
+        if url_match:
+            result_url = urllib.parse.unquote(url_match.group(1))
+            # DuckDuckGo uses redirect URLs, extract actual URL
+            if 'uddg=' in result_url:
+                actual_url = re.search(r'uddg=([^&]+)', result_url)
+                if actual_url:
+                    return urllib.parse.unquote(actual_url.group(1))
+            return result_url
+    except Exception as e:
+        print(f"Warning: Could not search URL on DuckDuckGo: {e}", file=sys.stderr)
+    
+    return None
+
+
+def download_image(url, dest):
+    """Download image from URL (supports regular URLs and favicons)"""
+    try:
+        # If it's a base URL without path, try favicon
+        parsed = urlparse(url)
+        if not parsed.path or parsed.path == '/':
+            url = f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+        
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=10) as response:
+            dest.write_bytes(response.read()) if isinstance(dest, Path) else open(dest, 'wb').write(response.read())
+        return True
+    except Exception as e:
+        print(f"Warning: Could not download image: {e}", file=sys.stderr)
+        return False
+
+
+def get_icon(name, url, custom_icon_path=None):
+    """Get icon for the webapp - from custom path, local icons, DuckDuckGo search, or favicon"""
+    safe = safe_name(name).lower()
+    icon_file = ICON_DIR / f"{safe}.png"
+    local_icons_dir = Path.home() / ".icons"
+    local_icon_backup = local_icons_dir / f"{safe}.png"
+    
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+    local_icons_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 1. Use custom icon if provided
+    if custom_icon_path:
+        custom_path = Path(custom_icon_path).expanduser()
+        if custom_path.exists():
+            shutil.copy(custom_path, icon_file)
+            # Also save to local icons for future use
+            shutil.copy(custom_path, local_icon_backup)
+            print(f"Using custom icon: {custom_icon_path}")
+            return icon_file
+        else:
+            print(f"Warning: Custom icon not found: {custom_icon_path}", file=sys.stderr)
+    
+    # 2. Search in $HOME/.icons directory
+    if local_icons_dir.exists():
+        print(f"Searching for icon in {local_icons_dir}...")
+        # Search for icon files matching the app name (case-insensitive)
+        name_lower = name.lower()
+        for icon_path in local_icons_dir.rglob("*"):
+            if icon_path.is_file() and name_lower in icon_path.stem.lower():
+                # Check if it's an image file
+                if icon_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.svg', '.ico']:
+                    shutil.copy(icon_path, icon_file)
+                    print(f"Found local icon: {icon_path}")
+                    return icon_file
+    
+    # 3. Search on DuckDuckGo
+    print(f"Searching for icon on DuckDuckGo...")
+    icon_url = search_duckduckgo_icons(name)
+    if icon_url and download_image(icon_url, icon_file):
+        shutil.copy(icon_file, local_icon_backup)
+        print(f"Downloaded icon from DuckDuckGo (saved to {local_icon_backup})")
+        return icon_file
+    
+    # 4. Try to download favicon
+    print(f"Trying to download favicon from {url}...")
+    if download_image(url, icon_file):
+        shutil.copy(icon_file, local_icon_backup)
+        print(f"Downloaded favicon (saved to {local_icon_backup})")
+        return icon_file
+    
+    # 5. Fallback to default Chromium icon
+    fallback = Path("/usr/share/icons/hicolor/48x48/apps/chromium.png")
+    if fallback.exists():
+        shutil.copy(fallback, icon_file)
+        print(f"Using fallback Chromium icon")
+        return icon_file
+    
+    print(f"Warning: Could not find any icon", file=sys.stderr)
+    return None
+
+
+def create_webapp(name, url=None, icon_path=None, isolated=False):
+    """Create a new webapp"""
+    # Infer URL if not provided
+    if not url:
+        print(f"URL not provided, searching DuckDuckGo for '{name}'...")
+        url = search_duckduckgo_url(name)
+        if url:
+            print(f"Found URL: {url}")
+        else:
+            print(f"Error: Could not find URL for '{name}'", file=sys.stderr)
+            return False
+    
+    # Add https:// if no scheme is provided
+    if url and not url.startswith(('http://', 'https://')):
+        url = f"https://{url}"
+        print(f"Added https:// prefix: {url}")
+    
+    profile_id = generate_profile_id(name)
+    safe = safe_name(name)
+    desktop_filename = f"{DESKTOP_PREFIX}{profile_id}"
+    
+    desktop_file = APP_DIR / f"{desktop_filename}.desktop"
+    
+    # Check if webapp already exists (case-insensitive search)
+    existing = find_webapp_by_name(name)
+    if existing:
+        print(f"Error: Webapp '{name}' already exists at {existing}", file=sys.stderr)
+        return False
+    
+    # Create directories
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Get icon
+    icon_file = get_icon(name, url, icon_path)
+    icon_path_str = str(icon_file) if icon_file else "chromium"
+    
+    # Build Chromium command
+    if isolated:
+        # Create isolated profile directory
+        profile_path = PROFILE_DIR / profile_id
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        profile_path.mkdir(parents=True, exist_ok=True)
+        
+        # Copy Google authentication files from default Chromium profile
+        default_profile = Path.home() / ".config/chromium/Default"
+        if default_profile.exists():
+            print(f"Copying Google authentication from default profile...")
+            auth_files = ["Cookies", "Cookies-journal", "Login Data", "Login Data-journal", 
+                         "Web Data", "Web Data-journal", "Preferences", "Network"]
+            for auth_file in auth_files:
+                src = default_profile / auth_file
+                dst = profile_path / auth_file
+                if src.exists() and not dst.exists():
+                    try:
+                        if src.is_file():
+                            shutil.copy2(src, dst)
+                        elif src.is_dir():
+                            shutil.copytree(src, dst, dirs_exist_ok=True)
+                    except Exception as e:
+                        print(f"  Warning: Could not copy {auth_file}: {e}", file=sys.stderr)
+        
+        chromium_cmd = f"chromium --app={url} --class={safe} --name={safe} --user-data-dir={profile_path}"
+        print(f"Created isolated profile with copied Google auth: {profile_path}")
+    else:
+        # Default: use shared profile (no profile-directory parameter)
+        chromium_cmd = "chromium --app=" + url
+        print(f"Using shared Chromium profile")
+    
+    # Create launcher script
+    script_file = SCRIPT_DIR / f"webapp-{safe}"
+    if isolated:
+        # For isolated apps, kill by window class name
+        kill_cmd = f'xdotool search --classname "{safe}" windowkill 2>/dev/null || true'
+    else:
+        # For shared profile apps, kill by process matching
+        kill_cmd = 'ps aux | grep "chromium --app=' + url + '" | grep -v grep | awk "{print $2}" | xargs -r kill 2>/dev/null || true'
+    
+    script_content = f"""#!/bin/bash
+# Kill existing instance
+{kill_cmd}
+sleep 0.1
+# Launch webapp
+exec {chromium_cmd}
+"""
+    script_file.write_text(script_content)
+    script_file.chmod(0o755)
+    
+    # Create desktop entry pointing to the script
+    desktop_content = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={name}\n"
+        f"Exec={script_file}\n"
+        f"Icon={icon_path_str}\n"
+        "Terminal=false\n"
+        "Categories=WebApp;\n"
+        f"StartupWMClass={safe}\n"
+    )
+    
+    desktop_file.write_text(desktop_content)
+    desktop_file.chmod(0o755)
+    
+    print(f"✓ Webapp '{name}' created successfully!")
+    print(f"  Desktop entry: {desktop_file}")
+    print(f"  Launch script: {script_file}")
+    print(f"  Class: {desktop_filename}")
+    return True
+
+
+def find_webapp_by_name(name):
+    """Find webapp desktop file by name (case-insensitive)"""
+    if not APP_DIR.exists():
+        return None
+    
+    name_lower = name.lower()
+    
+    for desktop_file in APP_DIR.glob(f"{DESKTOP_PREFIX}*.desktop"):
+        try:
+            content = desktop_file.read_text()
+            name_match = re.search(r'^Name=(.+)$', content, re.MULTILINE)
+            if name_match and name_match.group(1).lower() == name_lower:
+                return desktop_file
+        except Exception:
+            continue
+    
+    return None
+
+
+def delete_webapp(name):
+    """Delete an existing webapp (case-insensitive)"""
+    desktop_file = find_webapp_by_name(name)
+    
+    if not desktop_file:
+        print(f"Error: Webapp '{name}' not found", file=sys.stderr)
+        return False
+    
+    # Extract profile path and icon from desktop file
+    content = desktop_file.read_text()
+    profile_match = re.search(r'--user-data-dir=([^\s]+)', content)
+    icon_match = re.search(r'^Icon=(.+)$', content, re.MULTILINE)
+    
+    # Extract script path
+    safe = safe_name(name)
+    script_file = SCRIPT_DIR / f"webapp-{safe}"
+    
+    deleted = False
+    
+    # Delete desktop entry
+    desktop_file.unlink()
+    print(f"✓ Deleted desktop entry: {desktop_file}")
+    deleted = True
+    
+    # Delete script
+    if script_file.exists():
+        script_file.unlink()
+        print(f"✓ Deleted script: {script_file}")
+    
+    # Delete profile
+    if profile_match:
+        profile_path = Path(profile_match.group(1))
+        if profile_path.exists():
+            shutil.rmtree(profile_path)
+            print(f"✓ Deleted profile: {profile_path}")
+    
+    # Delete icon
+    if icon_match:
+        icon_path = Path(icon_match.group(1))
+        if icon_path.exists() and icon_path.parent == ICON_DIR:
+            icon_path.unlink()
+            print(f"✓ Deleted icon: {icon_path}")
+    
+    print(f"✓ Webapp '{name}' deleted successfully!")
+    return True
+
+
+def preview_image(image_path):
+    """Try to preview an image in terminal or external viewer"""
+    import subprocess
+    devnull = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
+    
+    # Try terminal renderers first
+    for cmd in [['kitty', '+kitten', 'icat', '--align', 'left'], ['chafa', '--size', '20x20']]:
+        try:
+            subprocess.run(cmd + [str(image_path)], timeout=2, stdin=subprocess.DEVNULL, check=False)
+            return True
+        except:
+            pass
+    
+    # Fallback: system viewer
+    try:
+        subprocess.Popen(['xdg-open', str(image_path)], **devnull)
+        return True
+    except:
+        return False
+
+
+def change_icon(name):
+    """Change the icon for an existing webapp by selecting from 5 options"""
+    # Find the webapp
+    desktop_file = find_webapp_by_name(name)
+    if not desktop_file:
+        print(f"Error: Webapp '{name}' not found", file=sys.stderr)
+        return False
+    
+    desktop_path = Path(desktop_file)
+    
+    # Search for icons
+    print(f"Searching for icons for '{name}'...")
+    icons = search_duckduckgo_icons(name, count=5)
+    
+    if not icons:
+        print("No icons found. Try a different search term.", file=sys.stderr)
+        return False
+    
+    # Download icons to temp directory for preview
+    import tempfile
+    temp_dir = Path(tempfile.mkdtemp(prefix='wpp-icons-'))
+    temp_files = []
+    
+    print("\nDownloading icons for preview...")
+    for i, icon_url in enumerate(icons, 1):
+        temp_file = temp_dir / f"icon_{i}.png"
+        if download_image(icon_url, temp_file):
+            temp_files.append(temp_file)
+        else:
+            temp_files.append(None)
+    
+    # Display options with preview
+    print("\nAvailable icons:")
+    for i, (icon_url, temp_file) in enumerate(zip(icons, temp_files), 1):
+        print(f"\n  {i}. {icon_url}")
+        if temp_file:
+            preview_image(temp_file)
+    
+    # Get user choice
+    while True:
+        try:
+            choice = input("\nSelect icon (1-5, 'p' to preview in viewer, or 0 to cancel): ").strip().lower()
+            
+            if choice == 'p':
+                # Open all previews in image viewer
+                for temp_file in temp_files:
+                    if temp_file:
+                        import subprocess
+                        subprocess.Popen(['xdg-open', str(temp_file)],
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                print("Opening previews in image viewer...")
+                continue
+            
+            choice_num = int(choice)
+            if choice_num == 0:
+                print("Cancelled.")
+                shutil.rmtree(temp_dir)
+                return False
+            if 1 <= choice_num <= len(icons):
+                break
+            print(f"Please enter a number between 1 and {len(icons)}")
+        except (ValueError, KeyboardInterrupt):
+            print("\nCancelled.")
+            shutil.rmtree(temp_dir)
+            return False
+        except EOFError:
+            print("\nError: Cannot read input (stdin closed or redirected)", file=sys.stderr)
+            shutil.rmtree(temp_dir)
+            return False
+    
+    # Use the already downloaded temp file
+    selected_temp = temp_files[choice_num - 1]
+    if not selected_temp:
+        print("Failed to download selected icon", file=sys.stderr)
+        shutil.rmtree(temp_dir)
+        return False
+    
+    # Save to final location
+    safe = safe_name(name).lower()
+    icon_file = ICON_DIR / f"{safe}.png"
+    local_icons_dir = Path.home() / ".icons"
+    local_icon_backup = local_icons_dir / f"{safe}.png"
+    
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+    local_icons_dir.mkdir(parents=True, exist_ok=True)
+    
+    shutil.copy(selected_temp, icon_file)
+    shutil.copy(selected_temp, local_icon_backup)
+    
+    # Clean up temp directory
+    shutil.rmtree(temp_dir)
+    
+    # Update desktop file
+    content = desktop_path.read_text()
+    updated = '\n'.join(f'Icon={icon_file}' if line.startswith('Icon=') else line 
+                        for line in content.split('\n'))
+    desktop_path.write_text(updated)
+    
+    print(f"\n✓ Icon updated successfully!")
+    print(f"  Icon: {icon_file}")
+    print(f"  Desktop entry: {desktop_path}")
+    return True
+
+
+def get_webapp_info(desktop_file):
+    """Extract webapp information from desktop file"""
+    content = desktop_file.read_text()
+    name_match = re.search(r'^Name=(.+)$', content, re.MULTILINE)
+    icon_match = re.search(r'^Icon=(.+)$', content, re.MULTILINE)
+    exec_match = re.search(r'^Exec=(.+)$', content, re.MULTILINE)
+    
+    url = None
+    isolated = False
+    
+    # If Exec points to a script, read the script to get URL and isolated flag
+    if exec_match:
+        exec_path = Path(exec_match.group(1).split()[0])  # Get first part (script path)
+        if exec_path.exists() and exec_path.is_file():
+            script_content = exec_path.read_text()
+            url_match = re.search(r'--app=([^\s]+)', script_content)
+            if url_match:
+                url = url_match.group(1)
+            isolated = '--user-data-dir=' in script_content
+        else:
+            # Old format: URL in desktop file directly
+            url_match = re.search(r'--app=([^\s\']+)', content)
+            if url_match:
+                url = url_match.group(1)
+            isolated = '--user-data-dir=' in content
+    
+    return {
+        'name': name_match.group(1) if name_match else desktop_file.stem,
+        'url': url,
+        'isolated': isolated,
+        'icon': icon_match.group(1) if icon_match else None,
+        'file': desktop_file
+    }
+
+
+def list_webapps():
+    """List all installed webapps"""
+    if not APP_DIR.exists():
+        print("No webapps found")
+        return []
+    
+    webapps = list(APP_DIR.glob(f"{DESKTOP_PREFIX}*.desktop"))
+    
+    if not webapps:
+        print("No webapps found")
+        return []
+    
+    print(f"Found {len(webapps)} webapp(s):")
+    webapp_list = []
+    for desktop_file in sorted(webapps):
+        info = get_webapp_info(desktop_file)
+        webapp_list.append(info)
+        
+        print(f"  • {info['name']}")
+        print(f"    URL: {info['url']}")
+        print(f"    Isolated: {info['isolated']}")
+        print(f"    File: {info['file']}")
+    
+    return webapp_list
+
+
+def recreate_all():
+    """Recreate all existing webapps with current settings"""
+    if not APP_DIR.exists():
+        print("No webapps found to recreate")
+        return False
+    
+    webapps = list(APP_DIR.glob(f"{DESKTOP_PREFIX}*.desktop"))
+    if not webapps:
+        print("No webapps found to recreate")
+        return False
+    
+    print(f"Found {len(webapps)} webapp(s) to recreate")
+    
+    # Extract info from all webapps
+    webapp_configs = []
+    for desktop_file in webapps:
+        info = get_webapp_info(desktop_file)
+        if info['url']:
+            webapp_configs.append(info)
+    
+    if not webapp_configs:
+        print("No valid webapps to recreate")
+        return False
+    
+    # Confirm action
+    try:
+        confirm = input(f"\nRecreate {len(webapp_configs)} webapp(s)? [Y/n]: ").strip().lower()
+        if confirm == 'n':
+            print("Cancelled.")
+            return False
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        return False
+    
+    # Delete and recreate each webapp
+    success_count = 0
+    for info in webapp_configs:
+        print(f"\nRecreating '{info['name']}'...")
+        
+        # Delete old webapp
+        if delete_webapp(info['name']):
+            # Recreate with same settings
+            icon_path = info['icon'] if info['icon'] and Path(info['icon']).exists() else None
+            if create_webapp(info['name'], info['url'], icon_path, info['isolated']):
+                success_count += 1
+    
+    print(f"\n✓ Successfully recreated {success_count}/{len(webapp_configs)} webapp(s)")
+    return success_count == len(webapp_configs)
+
+
+def delete_all():
+    """Delete all webapps"""
+    if not APP_DIR.exists():
+        print("No webapps found")
+        return False
+    
+    webapps = list(APP_DIR.glob(f"{DESKTOP_PREFIX}*.desktop"))
+    if not webapps:
+        print("No webapps found")
+        return False
+    
+    print(f"Found {len(webapps)} webapp(s) to delete")
+    
+    # Confirm action
+    try:
+        confirm = input(f"\nDelete ALL {len(webapps)} webapp(s)? [y/N]: ").strip().lower()
+        if confirm != 'y':
+            print("Cancelled.")
+            return False
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        return False
+    
+    # Delete each webapp
+    success_count = 0
+    for desktop_file in webapps:
+        info = get_webapp_info(desktop_file)
+        if delete_webapp(info['name']):
+            success_count += 1
+    
+    print(f"\n✓ Successfully deleted {success_count}/{len(webapps)} webapp(s)")
+    return success_count == len(webapps)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Manage web applications as desktop entries",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s create "Gmail" "https://mail.google.com"
+  %(prog)s create "Gmail"  # Auto-detect URL from DuckDuckGo
+  %(prog)s create "Slack" "https://slack.com" --isolated  # Isolated profile with copied auth
+  %(prog)s create "Notion" "https://notion.so" --icon ~/Downloads/notion.png
+  %(prog)s change-icon "Gmail"
+  %(prog)s delete "Gmail"
+  %(prog)s list
+  %(prog)s recreate-all  # Recreate all webapps (useful after updates)
+        """
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
+    
+    # Create command
+    create_parser = subparsers.add_parser('create', help='Create a new webapp')
+    create_parser.add_argument('name', help='Name of the webapp')
+    create_parser.add_argument('url', nargs='?', help='URL of the webapp (auto-detected if omitted)')
+    create_parser.add_argument('--icon', help='Path to custom icon file')
+    create_parser.add_argument('--isolated', action='store_true',
+                              help='Create isolated profile with copied Google authentication')
+    
+    # Delete command
+    delete_parser = subparsers.add_parser('delete', help='Delete an existing webapp')
+    delete_parser.add_argument('name', help='Name of the webapp to delete (case-insensitive)')
+    
+    # List command
+    subparsers.add_parser('list', help='List all installed webapps')
+    
+    # Recreate all command
+    subparsers.add_parser('recreate-all', help='Recreate all webapps with current settings')
+    
+    # Delete all command
+    subparsers.add_parser('delete-all', help='Delete all webapps')
+    
+    # Change icon command
+    change_icon_parser = subparsers.add_parser('change-icon', help='Change webapp icon')
+    change_icon_parser.add_argument('name', help='Name of the webapp')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        list_webapps()
+        return 0
+    
+    if args.command == 'create':
+        success = create_webapp(args.name, args.url, args.icon, args.isolated)
+        return 0 if success else 1
+    elif args.command == 'delete':
+        success = delete_webapp(args.name)
+        return 0 if success else 1
+    elif args.command == 'list':
+        list_webapps()
+        return 0
+    elif args.command == 'recreate-all':
+        success = recreate_all()
+        return 0 if success else 1
+    elif args.command == 'delete-all':
+        success = delete_all()
+        return 0 if success else 1
+    elif args.command == 'change-icon':
+        success = change_icon(args.name)
+        return 0 if success else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
