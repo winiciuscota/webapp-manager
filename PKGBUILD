@@ -1,14 +1,14 @@
-# Maintainer: Your Name <your.email@example.com>
+# Maintainer: Winícius Cota <winicius.cota@gmail.com>
 pkgname=webapp-manager
 pkgver=1.0.0
 pkgrel=1
 pkgdesc="A modern Rofi-based interface for managing web applications with icon search"
 arch=('any')
-url="https://github.com/YOUR_USERNAME/webapp-manager"
+url="https://github.com/winiciuscota/webapp-manager"
 license=('MIT')
 depends=('python' 'rofi' 'webkit2gtk' 'gtk3')
 makedepends=('git')
-source=("git+https://github.com/YOUR_USERNAME/webapp-manager.git")
+source=("git+https://github.com/winiciuscota/webapp-manager.git")
 sha256sums=('SKIP')
 
 package() {

@@ -31,7 +31,7 @@ yay -S webapp-manager
 ### Manual Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/webapp-manager.git
+git clone https://github.com/winiciuscota/webapp-manager.git
 cd webapp-manager
 chmod +x install.sh
 ./install.sh
