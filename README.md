@@ -22,10 +22,12 @@ A modern Rofi-based interface for managing web applications with icon search and
 
 ## Installation
 
-### From AUR (Arch Linux)
+### Arch Linux (from PKGBUILD)
 
 ```bash
-yay -S webapp-manager
+git clone https://github.com/winiciuscota/webapp-manager.git
+cd webapp-manager
+makepkg -si
 ```
 
 ### Manual Installation
